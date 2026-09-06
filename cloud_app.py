@@ -42,7 +42,12 @@ def deepseek(messages, tools=None):
     if tools: payload["tools"] = tools
     r = httpx.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=90)
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]
+    data = r.json()
+    if "choices" not in data or not data["choices"]:
+        err = data.get("error") if isinstance(data, dict) else None
+        msg = err.get("message", "OpenRouter busy - try again") if isinstance(err, dict) else "OpenRouter busy - try again"
+        raise RuntimeError(msg)
+    return data["choices"][0]["message"]
 
 def g_rpc(method, params=None):
     h = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json",
