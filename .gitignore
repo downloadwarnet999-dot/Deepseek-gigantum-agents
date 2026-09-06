@@ -1,0 +1,8 @@
+venv/
+.streamlit/
+bot.log
+__pycache__/
+nohup.out
+*.txt
+!requirements.txt
+*.sh
