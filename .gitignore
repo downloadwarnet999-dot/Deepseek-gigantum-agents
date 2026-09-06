@@ -1,8 +1,6 @@
 venv/
 .streamlit/
 bot.log
+phoenix.log
 __pycache__/
 nohup.out
-*.txt
-!requirements.txt
-*.sh
