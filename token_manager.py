@@ -18,7 +18,6 @@ def load_secrets():
         return tomllib.load(f)
 
 def save_secrets(updates):
-    """Update existing keys OR add missing keys at TOP level (above [auth])"""
     with open(SECRETS_PATH, "r") as f:
         content = f.read()
     for key, value in updates.items():
@@ -48,6 +47,27 @@ def should_refresh():
     hours_since = (time.time() - float(last_refresh)) / 3600
     return days_left < 7 or hours_since > 12
 
+def sync_to_supabase():
+    s = load_secrets()
+    try:
+        r = httpx.post(
+            s["SUPABASE_URL"] + "/rest/v1/token_vault",
+            headers={"apikey": s["SUPABASE_ANON_KEY"],
+                     "Authorization": f"Bearer {s['SUPABASE_ANON_KEY']}",
+                     "Content-Type": "application/json",
+                     "Prefer": "resolution=merge-duplicates"},
+            json={"id": 1,
+                  "gigantum_access_token": s.get("GIGANTUM_ACCESS_TOKEN", ""),
+                  "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())},
+            timeout=15)
+        if r.status_code in (200, 201):
+            print("Token synced to Supabase vault")
+            return True
+        print(f"Vault sync status: {r.status_code}")
+    except Exception as e:
+        print(f"Vault sync warning: {e}")
+    return False
+
 def refresh_token():
     with _refresh_lock:
         secrets = load_secrets()
@@ -70,6 +90,7 @@ def refresh_token():
                 if d.get("refresh_token"):
                     updates["GIGANTUM_REFRESH_TOKEN"] = d["refresh_token"]
                 save_secrets(updates)
+                sync_to_supabase()
                 days_left = days_until_expiry(d["access_token"])
                 print(f"Token refreshed! Valid for {days_left:.1f} more days")
                 return True

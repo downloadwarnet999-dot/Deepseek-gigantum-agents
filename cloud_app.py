@@ -1,24 +1,10 @@
 import streamlit as st
-import json, httpx, base64, time
+import json, httpx
 
 S = st.secrets
 st.set_page_config(page_title="DeepSeek + Gigantum Cloud", layout="wide")
 
-def decode_jwt(token):
-    try:
-        payload = token.split('.')[1]
-        payload += '=' * (-len(payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload))
-    except Exception:
-        return {}
-
-def days_until_expiry(token):
-    if not token: return -1
-    payload = decode_jwt(token)
-    exp = payload.get('exp', 0)
-    return (exp - time.time()) / 86400
-
-# Auth
+# ---------- AUTH GATE (both users) ----------
 if "authenticated" not in st.session_state: st.session_state.authenticated = False
 if not st.session_state.authenticated:
     st.title("🔐 Secure Login")
@@ -31,14 +17,24 @@ if not st.session_state.authenticated:
             else: st.error("Invalid credentials")
     st.stop()
 
-# Token status
-days_left = days_until_expiry(S.get("GIGANTUM_ACCESS_TOKEN", ""))
-st.success(f"🔑 Token valid for {days_left:.1f} more days")
-
 st.title("📈 DeepSeek + Gigantum Cloud Agent")
 if st.button("Logout"):
-    st.session_state.authenticated = False
-    st.rerun()
+    st.session_state.authenticated = False; st.rerun()
+
+# ---------- LIVE TOKEN FROM SUPABASE VAULT (auto-fresh) ----------
+@st.cache_data(ttl=300)
+def get_vault_token():
+    try:
+        r = httpx.get(S["SUPABASE_URL"] + "/rest/v1/token_vault?id=eq.1&select=gigantum_access_token",
+                      headers={"apikey": S["SUPABASE_ANON_KEY"],
+                               "Authorization": f"Bearer {S['SUPABASE_ANON_KEY']}"},
+                      timeout=10)
+        rows = r.json()
+        if rows and rows[0].get("gigantum_access_token"):
+            return rows[0]["gigantum_access_token"]
+    except Exception:
+        pass
+    return S.get("GIGANTUM_ACCESS_TOKEN", "")
 
 def deepseek(messages, tools=None):
     headers = {"Authorization": f"Bearer {S['OPENROUTER_API_KEY']}", "Content-Type": "application/json"}
@@ -50,7 +46,7 @@ def deepseek(messages, tools=None):
 
 def g_rpc(method, params=None):
     h = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json",
-         "Authorization": f"Bearer {S['GIGANTUM_ACCESS_TOKEN']}"}
+         "Authorization": f"Bearer {get_vault_token()}"}
     payload = {"jsonrpc": "2.0", "id": 1, "method": method}
     if params: payload["params"] = params
     try:
@@ -68,7 +64,7 @@ def g_rpc(method, params=None):
 
 def run_agent(prompt):
     tool_used = "None"
-    init = g_rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "cloud", "version": "1.0"}})
+    init = g_rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "cloud", "version": "2.0"}})
     if init:
         tools = (g_rpc("tools/list") or {}).get("result", {}).get("tools", [])
         ot = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("inputSchema", {"type": "object", "properties": {}})}} for t in tools]
@@ -93,6 +89,7 @@ def save_memory(prompt, ai_text, tool):
     except Exception:
         pass
 
+# ---------- CHAT UI ----------
 if "messages" not in st.session_state: st.session_state.messages = []
 for m in st.session_state.messages:
     with st.chat_message(m["role"]): st.markdown(m["content"])
