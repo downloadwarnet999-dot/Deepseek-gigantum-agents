@@ -1,11 +1,13 @@
-import json, httpx, time
-import token_manager
+import json, httpx, time, os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
+# CLOUD-READY SECRET LOADER
+def get_secret(key, default=""):
+    return os.environ.get(key, default)
+
 def deepseek(messages, tools=None):
-    s = token_manager.load_secrets()
-    headers = {"Authorization": f"Bearer {s['OPENROUTER_API_KEY']}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {get_secret('OPENROUTER_API_KEY')}", "Content-Type": "application/json"}
     payload = {"model": "deepseek/deepseek-chat", "messages": messages}
     if tools: payload["tools"] = tools
     for attempt in range(3):
@@ -14,9 +16,7 @@ def deepseek(messages, tools=None):
             r.raise_for_status()
             data = r.json()
             if "choices" not in data or not data["choices"]:
-                err = data.get("error") if isinstance(data, dict) else None
-                msg = err.get("message", "OpenRouter busy - try again") if isinstance(err, dict) else "OpenRouter busy - try again"
-                raise RuntimeError(msg)
+                raise RuntimeError("OpenRouter busy - try again")
             return data["choices"][0]["message"]
         except Exception:
             if attempt == 2: raise
@@ -24,12 +24,28 @@ def deepseek(messages, tools=None):
 
 class GigantumMCP:
     def __init__(self):
-        s = token_manager.load_secrets()
-        self.url = s["GIGANTUM_MCP_URL"]; self.sid = None; self._n = 0
+        self.url = get_secret("GIGANTUM_MCP_URL")
+        self.sid = None; self._n = 0
     def _hdr(self):
-        s = token_manager.load_secrets()
+        # In cloud, we rely on the fact that the token is fresh, or we could add vault fetch here
+        # For simplicity, we assume the token in env vars is valid, or we fetch from vault:
+        token = get_secret("GIGANTUM_ACCESS_TOKEN")
+        if not token:
+            token = self._fetch_vault_token()
         return {"Accept": "application/json, text/event-stream", "Content-Type": "application/json",
-                "Authorization": f"Bearer {s.get('GIGANTUM_ACCESS_TOKEN','')}"}
+                "Authorization": f"Bearer {token}"}
+    
+    def _fetch_vault_token(self):
+        try:
+            r = httpx.get(get_secret("SUPABASE_URL") + "/rest/v1/token_vault?id=eq.1&select=gigantum_access_token",
+                          headers={"apikey": get_secret("SUPABASE_ANON_KEY"),
+                                   "Authorization": f"Bearer {get_secret('SUPABASE_ANON_KEY')}"}, timeout=10)
+            rows = r.json()
+            if rows and rows[0].get("gigantum_access_token"):
+                return rows[0]["gigantum_access_token"]
+        except Exception: pass
+        return ""
+
     def _rpc(self, method, params=None, retry=True):
         self._n += 1
         payload = {"jsonrpc": "2.0", "id": self._n, "method": method}
@@ -39,8 +55,7 @@ class GigantumMCP:
         try:
             r = httpx.post(self.url, json=payload, headers=h, timeout=30)
             if r.status_code == 401 and retry:
-                if token_manager.refresh_token(): return self._rpc(method, params, retry=False)
-                return None
+                return None # Cloud bot relies on fresh vault token
             self.sid = r.headers.get("Mcp-Session-Id", self.sid)
             if "text/event-stream" in r.headers.get("content-type", ""):
                 data = None
@@ -52,21 +67,23 @@ class GigantumMCP:
             return r.json() if r.status_code < 400 else None
         except Exception:
             return None
+
     def connect(self):
-        ok = self._rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "termux-bot", "version": "3.0"}})
+        ok = self._rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "render-cloud-bot", "version": "4.0"}})
         self._rpc("notifications/initialized")
         return ok is not None and "error" not in ok
+
     def tools(self):
         return (self._rpc("tools/list") or {}).get("result", {}).get("tools", [])
+
     def call(self, name, args):
         res = self._rpc("tools/call", {"name": name, "arguments": args}) or {}
         return "\n".join([c.get("text", "") for c in res.get("result", {}).get("content", []) if isinstance(c, dict)])
 
 def save_memory(prompt, ai_text, tool):
-    s = token_manager.load_secrets()
     try:
-        httpx.post(s["SUPABASE_URL"] + "/rest/v1/stock_agent_memory",
-            headers={"apikey": s["SUPABASE_ANON_KEY"], "Authorization": f"Bearer {s['SUPABASE_ANON_KEY']}",
+        httpx.post(get_secret("SUPABASE_URL") + "/rest/v1/stock_agent_memory",
+            headers={"apikey": get_secret("SUPABASE_ANON_KEY"), "Authorization": f"Bearer {get_secret('SUPABASE_ANON_KEY')}",
                      "Content-Type": "application/json", "Prefer": "return=minimal"},
             json={"user_prompt": prompt, "ai_response": ai_text, "gigantum_tool_used": tool}, timeout=20)
     except Exception:
@@ -77,6 +94,8 @@ def run_agent(prompt):
     try:
         if g.connect():
             gt = g.tools()
+            ot = [{"type": "icon", "function": {"name": t["name"], "description": t.get("description", ""),
+                   "parameters": t.get("inputSchema", {"type": "object", "properties": {}})}} for t in gt] # Note: fixed typo 'icon' to 'function' below
             ot = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""),
                    "parameters": t.get("inputSchema", {"type": "object", "properties": {}})}} for t in gt]
             if ot:
@@ -94,12 +113,10 @@ def run_agent(prompt):
     return deepseek([{"role": "user", "content": prompt}])["content"], tool_used
 
 async def start(update, context):
-    st_ = token_manager.get_token_status()
     await context.bot.send_message(chat_id=update.effective_chat.id,
-        text=f"📈 DeepSeek + Gigantum Bot Online\n🔑 Token: {st_['access_days_left']} days left\n🔥 Auto-refresh + vault sync active")
+        text="📈 DeepSeek + Gigantum Cloud Bot Online!\n🔥 Running 24/7 in the cloud. Zero phone battery used.")
 
 async def handle_message(update, context):
-    token_manager.ensure_fresh_token()
     msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="⏳ Analyzing market data...")
     try:
         answer, tool = run_agent(update.message.text)
@@ -110,9 +127,8 @@ async def handle_message(update, context):
     await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg.message_id, text=answer[:4000])
 
 if __name__ == '__main__':
-    s = token_manager.load_secrets()
-    token_manager.start_background_refresh()
-    app = ApplicationBuilder().token(s["TELEGRAM_BOT_TOKEN"]).build()
+    app = ApplicationBuilder().token(get_secret("TELEGRAM_BOT_TOKEN")).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    print("🚀 Cloud Bot Starting...")
     app.run_polling()
